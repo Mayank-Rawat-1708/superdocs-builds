@@ -18,17 +18,25 @@ import uuid
 
 from sqlalchemy import select
 
-from backend.agents.nodes.base import BaseNode, NodeSkip
+from backend.agents.nodes.base import BaseNode, NodeInputMissing
 from backend.agents.state import DigestState
 from backend.config import settings
 from backend.db.database import session_scope
 from backend.models import Conversation, RunStatus
+from backend.services.batching import indexed_json_call
 from backend.services.groq_client import GroqClient
 from backend.services.heuristics import heuristic_extract
 from backend.services.llm_gate import run_with_fallback
 from backend.services.vector_store import embed_conversations
 
 logger = logging.getLogger(__name__)
+
+# Completion tokens one extracted record needs: five fields, one of them a short noun
+# phrase, plus JSON punctuation. Measured at 70 tokens/record on a live 8-record batch
+# (556 completion tokens), so 72 left no margin at all for a record with a longer issue
+# phrase — and running out mid-answer costs the whole batch, not one record. Rounded up
+# on purpose; see CLASSIFY_TOKENS_PER_RECORD.
+EXTRACT_TOKENS_PER_RECORD = 96
 
 _SYSTEM = """\
 You extract structured facts from customer-support conversations.
@@ -53,6 +61,7 @@ the text, use "unknown" rather than guessing.
 class ExtractNode(BaseNode):
     stage = "extract"
     running_status = RunStatus.EXTRACTING
+    requires = ("ingest", "classify")
 
     async def run(self, state: DigestState, run_id: uuid.UUID) -> DigestState:
         async with session_scope() as session:
@@ -68,9 +77,15 @@ class ExtractNode(BaseNode):
             )
 
             if not rows:
-                raise NodeSkip(
-                    "No relevant conversations to extract facts from",
-                    {"facts_extracted": 0, "conversations_embedded": 0},
+                # Not a skip. Every stage after this one is built from extracted facts,
+                # so "nothing to extract" is not a stage with no work — it is a run with
+                # no subject. Producing an empty result here is what let a failed
+                # classify walk all the way to an approval gate holding nothing.
+                raise NodeInputMissing(
+                    "No relevant conversations to extract facts from. Either every "
+                    "ingested record was filtered out as non-support content, or the "
+                    "classify stage did not complete. There is nothing to analyse, so "
+                    "the run stops here rather than producing an empty digest."
                 )
 
             pending = [c for c in rows if not c.extracted_facts]
@@ -80,20 +95,30 @@ class ExtractNode(BaseNode):
 
             for start in range(0, len(pending), batch_size):
                 batch = pending[start : start + batch_size]
-                numbered = "\n\n".join(
-                    f"[{i}] {c.raw_text}" for i, c in enumerate(batch)
-                )
 
-                async def _llm(_numbered=numbered, _n=len(batch)):
+                async def _llm(_batch=batch):
                     groq = GroqClient()
                     try:
-                        payload, usage, _ = await groq.complete_json(
-                            _SYSTEM,
-                            f"Extract facts from these {_n} records.",
-                            untrusted_content=_numbered,
-                            max_tokens=3072,
+                        outcome = await indexed_json_call(
+                            groq,
+                            system=_SYSTEM,
+                            instruction=lambda n: (
+                                f"Extract facts from these {n} records."
+                            ),
+                            records=[c.raw_text for c in _batch],
+                            per_record_output_tokens=EXTRACT_TOKENS_PER_RECORD,
+                            max_output_tokens=3072,
                         )
-                        return payload, usage
+                        if outcome.splits:
+                            logger.info(
+                                "Extract sent %d requests (batch of %d split %d time(s) "
+                                "to stay under the provider's token ceiling)",
+                                outcome.calls, len(_batch), outcome.splits,
+                            )
+                        return (
+                            {"results": list(outcome.results.values())},
+                            outcome.usage,
+                        )
                     finally:
                         await groq.aclose()
 

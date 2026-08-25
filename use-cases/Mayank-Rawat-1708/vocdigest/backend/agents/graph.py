@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -161,12 +162,62 @@ async def persist_state(run_id: uuid.UUID, state: DigestState) -> None:
         run.checkpoint_data = checkpoint
 
 
+#: One lock per run. claim_stage() short-circuits a stage that is COMPLETE or SKIPPED,
+#: but a stage that is RUNNING is still claimable — so two executions of the same run
+#: interleave through it. That is not theoretical: several endpoints schedule an
+#: execution (resume, approve-all, stage retry, stage skip), and pressing two of them
+#: produced two executions walking the same pipeline, which is where the approval gate's
+#: repeated "GATE_OPENED / PAUSED ×6" came from, and how theme's inserts accumulated
+#: 16 -> 32 -> 48 -> 80 themes for one 19-conversation run. Serialising per run at the
+#: entry point is the narrow fix.
+#:
+#: In-process only. One uvicorn process is what this deployment runs; several would need
+#: the claim itself to reject a RUNNING stage in the database.
+_RUN_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _run_lock(run_id: uuid.UUID) -> asyncio.Lock:
+    return _RUN_LOCKS.setdefault(str(run_id), asyncio.Lock())
+
+
 async def execute_run(run_id: uuid.UUID) -> dict[str, Any]:
     """Run (or resume) the graph to its next stopping point.
 
     Returns a status dict rather than raising on a pause, because a pause is the normal
     outcome when a human gate is involved — the caller decides what to do next.
+
+    A run already executing is reported as such rather than executed a second time.
+    Two executions of one run do not go faster; they duplicate provider spend and
+    corrupt each other's state.
     """
+    lock = _run_lock(run_id)
+    # No await between the check and the acquire, so within one event loop this is
+    # indivisible: a second caller cannot slip past while the first is acquiring.
+    if lock.locked():
+        async with session_scope() as session:
+            run = await session.get(Run, run_id)
+            status = run.status.value if run else "UNKNOWN"
+        logger.info("Run %s is already executing; ignoring the duplicate start", run_id)
+        return {
+            "run_id": str(run_id),
+            "status": status,
+            "paused": False,
+            "already_running": True,
+            "reason": (
+                "This run is already executing. Starting it again would duplicate "
+                "provider spend and let two executions overwrite each other's state."
+            ),
+        }
+    async with lock:
+        try:
+            return await _execute_run_locked(run_id)
+        finally:
+            if not lock.locked():
+                _RUN_LOCKS.pop(str(run_id), None)
+
+
+async def _execute_run_locked(run_id: uuid.UUID) -> dict[str, Any]:
+    """execute_run's body, with the per-run lock already held."""
     # Fresh breaker per execution: a quota that was spent an hour ago may have reset,
     # and a resumed run deserves a real attempt rather than inheriting a stale verdict.
     from backend.services.llm_gate import reset_breaker

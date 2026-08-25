@@ -21,7 +21,7 @@ from datetime import date
 
 from sqlalchemy import select
 
-from backend.agents.nodes.base import BaseNode, NodeSkip
+from backend.agents.nodes.base import BaseNode, NodeInputMissing
 from backend.agents.state import DigestState
 from backend.db.database import session_scope
 from backend.models import RunStatus, Theme, TrendDirection
@@ -66,6 +66,7 @@ def _trend_label(theme: Theme) -> str:
 class DraftNode(BaseNode):
     stage = "draft"
     running_status = RunStatus.DRAFTING
+    requires = ("theme",)
 
     async def run(self, state: DigestState, run_id: uuid.UUID) -> DigestState:
         async with session_scope() as session:
@@ -80,7 +81,11 @@ class DraftNode(BaseNode):
             )
 
         if not themes:
-            raise NodeSkip("No themes to draft", {"draft_sections": {}})
+            raise NodeInputMissing(
+                "No themes to draft. A digest with no themes has no content, so the "
+                "run stops here rather than assembling an empty document.",
+                upstream_stage="theme",
+            )
 
         quarter = state.get("quarter_label", "This quarter")
         prior = state.get("prior_quarter_label", "last quarter")

@@ -53,6 +53,22 @@ class NodeSkip(Exception):
         self.result = result or {}
 
 
+class NodeInputMissing(RuntimeError):
+    """A stage's required input is empty or was never produced.
+
+    Distinct from NodeSkip, and the distinction is the whole point. A skip says "there
+    was nothing for me to do and the run is still sound" — no prior digest to compare
+    against, for example. This says "what I need does not exist", which means every
+    result downstream of here would be assembled from nothing. Raised rather than
+    returned empty, and not retried: an absent input does not appear on a second attempt.
+    """
+
+    def __init__(self, reason: str, *, upstream_stage: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.upstream_stage = upstream_stage
+
+
 class NodeCancelled(Exception):
     """The operator cancelled this run.
 
@@ -90,6 +106,12 @@ class BaseNode(abc.ABC):
     running_status: RunStatus = RunStatus.PENDING
     #: whether a failure here should fail the whole run (False => degrade and continue)
     fatal_on_error: bool = True
+    #: stages whose output this one is built from. Each must have COMPLETED — a stage
+    #: that failed, or that an operator skipped, has no output to build on, and running
+    #: anyway is how a failure turns into a plausible-looking empty result further down.
+    #: A stage that legitimately SKIPPED itself is not listed as a requirement by anyone,
+    #: because a legitimate skip means its absence was survivable.
+    requires: tuple[str, ...] = ()
 
     def __init__(self) -> None:
         if not self.stage:
@@ -145,6 +167,34 @@ class BaseNode(abc.ABC):
                         f"language model rather than continuing to spend.",
                         metadata={"tokens_used": spent},
                     )
+
+        # --- upstream dependency check ---
+        # A FAILED stage must stop the pipeline, and it must keep stopping it across
+        # resumes. Raising from the failing node halts the current invocation, but the
+        # next resume walks the same linear chain again, and an operator "skip stage"
+        # rewrites a failure as a SKIPPED checkpoint. Either way a later stage can find
+        # itself running on output that was never produced. The check belongs here, where
+        # every stage passes through, rather than in each node.
+        blocker = await self._blocking_upstream(run_id)
+        if blocker is not None:
+            upstream, status = blocker
+            message = (
+                f"Cannot run {self.stage}: the {upstream} stage it depends on is "
+                f"{status}, so its output does not exist. Fix or retry {upstream} "
+                f"first — running {self.stage} now would build on nothing."
+            )
+            logger.error("%s (run %s)", message, run_id)
+            async with session_scope() as session:
+                await append_decision(
+                    session, run_id, self.stage, "BLOCKED_UPSTREAM", message,
+                    metadata={"upstream_stage": upstream, "upstream_status": status},
+                )
+                await set_run_status(
+                    session, run_id, RunStatus.FAILED, error_message=message
+                )
+            state["error"] = message
+            state["failed_stage"] = upstream
+            raise RuntimeError(message)
 
         # --- resume check and claim, atomically ---
         # One locked transaction does both: "has this finished?" and "I am running it
@@ -262,6 +312,14 @@ class BaseNode(abc.ABC):
                 state["paused_reason"] = pause.reason
                 raise
 
+            except NodeInputMissing as exc:
+                # Not retryable: an input that does not exist will not exist on a second
+                # attempt. Fail immediately, with the reason the input was missing rather
+                # than a generic "failed after 3 attempts".
+                last_error = exc
+                logger.error("Stage %s has no usable input: %s", self.stage, exc.reason)
+                break
+
             except MissingCredentialError as exc:
                 # Retrying a missing key is pointless — it will not appear between
                 # attempts — and failing the run would discard completed stages. Pause
@@ -302,8 +360,11 @@ class BaseNode(abc.ABC):
                     break
                 await self._backoff(attempt - attempt_no + 1)
 
-        # Retries exhausted.
-        message = f"{self.stage} failed after {attempts} attempts: {last_error}"
+        # Retries exhausted, or an unretryable failure broke out of the loop.
+        if isinstance(last_error, NodeInputMissing):
+            message = f"{self.stage} cannot run: {last_error.reason}"
+        else:
+            message = f"{self.stage} failed after {attempts} attempts: {last_error}"
         async with session_scope() as session:
             await save_checkpoint(
                 session,
@@ -326,6 +387,29 @@ class BaseNode(abc.ABC):
         if self.fatal_on_error:
             raise RuntimeError(message) from last_error
         return state
+
+    async def _blocking_upstream(
+        self, run_id: uuid.UUID
+    ) -> tuple[str, str] | None:
+        """The first required upstream stage that has no usable output, if any.
+
+        Returns (stage, status). A required stage that has not run at all is not a
+        blocker: on a fresh run every stage is unrun when its successor is checked, and
+        the graph's own ordering guarantees it runs first.
+        """
+        if not self.requires:
+            return None
+        async with session_scope() as session:
+            run = await session.get(Run, run_id)
+            stages = ((run.checkpoint_data or {}) if run else {}).get("stages") or {}
+        for upstream in self.requires:
+            record = stages.get(upstream)
+            if not record:
+                continue
+            status = str(record.get("status") or "")
+            if status in {STAGE_FAILED, STAGE_SKIPPED}:
+                return upstream, status
+        return None
 
     @staticmethod
     def _delta(before: DigestState, after: DigestState) -> dict[str, Any]:

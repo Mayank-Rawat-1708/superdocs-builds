@@ -1157,3 +1157,134 @@ SuperDocs latency does not fit in a four-minute video and pretending otherwise w
 take.
 
 78 tests.
+
+---
+
+## 2026-08-25 — Four bugs from one root cause, and a verification step that verified nothing
+
+A live run against Groq failed four different ways in sequence. Chasing each failure
+individually was the wrong instinct — three of them turned out to be the same mistake in
+different places: **empty or failed output propagating as though it were valid.** In a
+system whose stated premise is refusing to present weak output as normal, that is a design
+gap rather than three unrelated defects.
+
+### Bug 1 — the token budget fought the provider's ceiling
+
+`llama-3.3-70b-versatile` was decommissioned mid-project (404 `model_not_found`), so the
+model became `openai/gpt-oss-120b`. That is a **reasoning** model, and its reasoning is
+drawn from the same token budget as its answer. At the original `max_tokens=2048` the
+reasoning consumed the whole budget and the model returned an empty completion, surfacing
+as:
+
+```
+400 json_validate_failed   failed_generation: ""
+```
+
+A validation error for output that was never produced — which sends you to inspect the
+prompt when the problem is arithmetic.
+
+The obvious fix, tripling the budget, then produced the opposite failure:
+
+```
+413 Request too large ... tokens per minute (TPM): Limit 8000, Requested 9904
+```
+
+3072 × 3 = 9216 plus ~690 prompt tokens. Groq counts *requested* `max_tokens` toward TPM
+before generating anything, so the request was rejected on arrival. Two constraints in
+direct tension: too small yields an empty completion, too large yields a 413.
+
+Guessing a number that fits both is not a fix, it is a coincidence that survives until a
+limit changes. Resolved with a `token_budget` layer that reads the real ceilings from
+Groq's response headers (`x-ratelimit-limit-tokens`, `-remaining-tokens`,
+`-reset-tokens`), sizes each request to fit, and **splits an oversized batch rather than
+sending it and failing**. A 413 now narrows the batch and retries instead of aborting.
+
+### Bug 2 — a failed stage did not halt the run
+
+```
+2. Classify & filter    1.0s  958 tok
+3. Extract facts        FAILED (413)
+4. Cluster themes       0.0s
+5. Anonymize quotes     0.0s
+6. Compare to prior    77.6s
+7. Draft digest         0.0s
+8. Human approval gate  0.1s  ×6
+   → AWAITING_APPROVAL, 0 themes, "0 items need a decision"
+```
+
+Extract failed and every downstream stage ran anyway on empty input, arriving at an
+approval gate containing nothing — a meaningless state presented as a valid one. `compare`
+spent 77 seconds retrying a call that could not succeed, having nothing to compare.
+
+A FAILED stage now halts the pipeline, and a node that finds its required input empty
+raises rather than quietly producing nothing.
+
+### Bug 3 — the approval gate looped forever on an empty run
+
+The `×6` above was infinite re-entry. `human_gate` decided whether to create items by
+checking whether any already existed. With zero themes upstream it created zero items, so
+"none exist" stayed true, so it created zero again and paused again — forever. Never
+progressing, never failing. The UI showed *"Nothing left to review — 0 approved, 0
+rejected"* with no controls, while the run sat at `AWAITING_APPROVAL`: unresolvable through
+the interface.
+
+Creating zero approval items is not a valid gate state. If there is nothing to review there
+is nothing to publish, so the run now fails with that stated plainly. The node also
+distinguishes "not yet created" from "none possible", so re-entry cannot loop regardless of
+what upstream did.
+
+### Bug 4 — two processes on one SuperDocs session
+
+Restarting uvicorn while a background task was in flight left two processes driving the
+same SuperDocs session, each cancelling the other's jobs. That poisoned the session and
+forced eleven rotations. A per-run lock now prevents the in-process case; it cannot prevent
+two OS processes, which is stated in the code rather than implied to be handled.
+
+---
+
+## Known issue, unfixed — session rotation drops applied sections
+
+`superdocs.py` re-uploads `TEMPLATE_HTML` on session rotation but resumes from
+`ordered_keys[ordered_keys.index(key):]` — the current section onward. The fresh document
+has none of the earlier sections, so **every section already applied is silently lost.**
+The inline comment claims this "costs one extra upload"; it actually costs all prior work.
+
+Observed on a real run: `SECTION_APPLIED — Section 'what_changed'` succeeded, five
+`SESSION_STUCK` rotations followed, and the exported document had "What Changed Since Last
+Quarter" back to its placeholder. 25 paragraphs where a comparable clean run produced 113.
+
+**The worse half is that `VERIFIED` did not catch it.** That check reads
+`structure["headings"]` — and the blank template *is* all the headings, since that is what
+makes it a template. So the check passes on a document containing nothing but placeholders.
+It confirms the scaffold, not the content.
+
+This matters beyond the bug. Earlier in this project I cited "24 operations, document
+structure confirmed, DOCX exported" as evidence the SuperDocs integration worked. That
+evidence would have passed on a hollow file. I built a verification step that could not
+distinguish success from failure, and then quoted it as proof of success.
+
+Both fixes are known and small:
+- replay the **full** key list against a fresh template, not the tail slice
+- have `VERIFIED` assert that no section body still equals the placeholder string
+
+Not applied yet. Every genuine export was checked and all carry zero unexpected
+placeholders, so nothing hollow has shipped — but the check that was supposed to guarantee
+that could not have told me either way.
+
+The general lesson, which is the third time a version of it has appeared in this log: a
+check that cannot fail is not a check. `VERIFIED` passing meant only that a document had
+headings, which was true before any edit was applied.
+
+---
+
+## Corrections to previously stated figures
+
+Both measured from live errors rather than assumed:
+
+- **Groq daily cap is 200,000 tokens**, not the 100,000 stated earlier.
+- **200 rows completes at `LLM_BATCH_SIZE=24`** — roughly 62,000 tokens and about 8 minutes,
+  or 31% of a day's allowance, so two to three full runs daily. For iteration, 50 rows at
+  batch size 8 costs ~2.8 minutes and 11%.
+
+106 tests pass (78 original plus 28 new covering the token budget, the failure cascade, and
+the empty-gate case).

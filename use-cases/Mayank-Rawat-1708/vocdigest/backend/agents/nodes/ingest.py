@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from backend.agents.nodes.base import BaseNode, NodeSkip
+from backend.agents.nodes.base import BaseNode, NodeInputMissing
 from backend.agents.state import DigestState
 from backend.config import settings
 from backend.db.database import session_scope
@@ -157,9 +157,13 @@ class IngestNode(BaseNode):
             )
 
         if not rows:
-            raise NodeSkip(
-                f"No usable conversations found in {path.name}",
-                {"conversations_ingested": 0, "ingest_warnings": [f"{path.name} was empty"]},
+            # An input file with nothing usable in it is not a stage with no work — it is
+            # a run with no subject. Skipping here left every later stage running on an
+            # empty database and the approval gate holding nothing.
+            raise NodeInputMissing(
+                f"No usable conversations found in {path.name}. Every row was empty, "
+                f"unparseable, or too short to analyse, so there is nothing to build a "
+                f"digest from."
             )
 
         async with session_scope() as session:

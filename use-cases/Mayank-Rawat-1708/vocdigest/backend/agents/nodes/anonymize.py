@@ -20,7 +20,7 @@ import uuid
 
 from sqlalchemy import select
 
-from backend.agents.nodes.base import BaseNode, NodeSkip
+from backend.agents.nodes.base import BaseNode, NodeInputMissing
 from backend.agents.state import DigestState
 from backend.config import settings
 from backend.db.database import session_scope
@@ -41,6 +41,7 @@ MIN_QUOTE_CHARS = 40
 class AnonymizeNode(BaseNode):
     stage = "anonymize"
     running_status = RunStatus.ANONYMIZING
+    requires = ("theme",)
 
     async def run(self, state: DigestState, run_id: uuid.UUID) -> DigestState:
         async with session_scope() as session:
@@ -50,9 +51,10 @@ class AnonymizeNode(BaseNode):
                 ).scalars()
             )
             if not themes:
-                raise NodeSkip(
-                    "No themes to draw quotes from",
-                    {"quotes_anonymized": 0, "quotes_needing_review": 0},
+                raise NodeInputMissing(
+                    "No themes to draw quotes from. The theme stage produced nothing, "
+                    "so there are no quotes to anonymize and nothing to publish.",
+                    upstream_stage="theme",
                 )
 
             # Regex redaction (emails, phones, URLs, ids) needs no model and must never

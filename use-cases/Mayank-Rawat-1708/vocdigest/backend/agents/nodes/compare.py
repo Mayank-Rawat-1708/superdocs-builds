@@ -26,9 +26,10 @@ from backend.agents.nodes.base import BaseNode, NodeSkip
 from backend.agents.state import DigestState
 from backend.db.database import session_scope
 from backend.models import RunStatus, Theme, TrendDirection
-from backend.services.groq_client import GroqClient
+from backend.services.groq_client import INJECTION_GUARD, GroqClient
 from backend.services.heuristics import heuristic_parse_prior_digest
 from backend.services.llm_gate import run_with_fallback
+from backend.services.token_budget import fit_untrusted_excerpt
 from backend.services.vector_store import get_embedder, match_prior_themes
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,35 @@ class CompareNode(BaseNode):
     fatal_on_error = False
 
     async def run(self, state: DigestState, run_id: uuid.UUID) -> DigestState:
+        # Nothing to compare against comes in two forms, and this is the one that used to
+        # cost 77 seconds: no themes on THIS side. The node would still read the prior
+        # digest, still send it to the model, still burn three retries and their backoff
+        # on a request that had nowhere to put its answer. Comparison is a join between
+        # two sets of themes — with one side empty the result is empty whatever the other
+        # side says, so establish that before spending anything.
+        async with session_scope() as session:
+            current_theme_count = len(
+                list(
+                    (
+                        await session.execute(
+                            select(Theme.id).where(Theme.run_id == run_id)
+                        )
+                    ).scalars()
+                )
+            )
+        if current_theme_count == 0:
+            raise NodeSkip(
+                "No themes in this quarter to compare against a prior digest",
+                {
+                    "comparison_available": False,
+                    "prior_themes_found": 0,
+                    "comparison_note": (
+                        "This quarter produced no themes, so there is nothing to "
+                        "compare against the prior digest."
+                    ),
+                },
+            )
+
         prior_path_str = state.get("last_digest_path")
         if not prior_path_str:
             await self.log_decision(
@@ -132,21 +162,40 @@ class CompareNode(BaseNode):
                 },
             )
 
+        # A prior digest is as long as it is, and a fixed 20,000-character slice is not
+        # a budget — 20,000 characters is roughly 6,000 tokens, which on an 8,000-token
+        # ceiling leaves no room for the answer. Size the slice to what actually fits and
+        # say how much was read, rather than sending a request that cannot be answered.
+        answer_budget = 2048
+        excerpt, excerpt_note = fit_untrusted_excerpt(
+            raw_text,
+            fixed_prompt=f"{INJECTION_GUARD}\n\n{_SYSTEM}"
+            + "Extract the themes from this prior-quarter digest.",
+            answer_tokens=answer_budget,
+        )
+        if excerpt_note:
+            logger.info("Prior digest %s: %s", prior_path.name, excerpt_note)
+
         async def _llm():
             groq = GroqClient()
             try:
                 payload, usage, _ = await groq.complete_json(
                     _SYSTEM,
                     "Extract the themes from this prior-quarter digest.",
-                    untrusted_content=raw_text[:20000],
-                    max_tokens=2048,
+                    untrusted_content=excerpt,
+                    max_tokens=answer_budget,
+                    min_completion_tokens=512,
                 )
                 return payload, usage
             finally:
                 await groq.aclose()
 
+        # Reading the prior digest has a real pattern-matching equivalent, so a request
+        # that cannot fit degrades to it with disclosure rather than failing. There is no
+        # batch here to split.
         gated = await run_with_fallback(
-            "compare", _llm, lambda: heuristic_parse_prior_digest(raw_text)
+            "compare", _llm, lambda: heuristic_parse_prior_digest(raw_text),
+            degrade_on_budget_error=True,
         )
         payload = gated.data
         self.usage.merge(gated.usage)

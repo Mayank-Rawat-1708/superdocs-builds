@@ -5,10 +5,11 @@
     and refuses to continue until every item has a decision. Rejecting one item never
     discards the rest — each row carries its own status and the draft is assembled from
     whatever survived.
-@flow: First entry -> create ApprovalItems from the draft and themes -> raise NodePause
-    so the run status becomes AWAITING_APPROVAL and control returns to the caller.
-    Resume entry -> re-enter, find items already decided -> filter the draft to approved
-    content -> continue.
+@flow: First entry -> create ApprovalItems from the draft and themes -> if zero items
+    were created the run FAILS (nothing to review means nothing to publish) -> otherwise
+    raise NodePause so the run status becomes AWAITING_APPROVAL and control returns to
+    the caller. Resume entry -> re-enter, find items already decided -> filter the draft
+    to approved content -> continue.
 @dependencies:
     - backend.models.ApprovalItem: the gate's persisted units
     - backend.agents.nodes.base.NodePause: the mechanism that suspends the graph
@@ -21,7 +22,7 @@ import uuid
 
 from sqlalchemy import select
 
-from backend.agents.nodes.base import BaseNode, NodePause
+from backend.agents.nodes.base import BaseNode, NodeInputMissing, NodePause
 from backend.agents.state import DigestState
 from backend.db.database import session_scope
 from backend.models import (
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 class HumanGateNode(BaseNode):
     stage = "human_gate"
     running_status = RunStatus.AWAITING_APPROVAL
+    requires = ("draft",)
 
     async def run(self, state: DigestState, run_id: uuid.UUID) -> DigestState:
         async with session_scope() as session:
@@ -49,18 +51,48 @@ class HumanGateNode(BaseNode):
                 ).scalars()
             )
 
+            created = 0
             if not existing:
                 created = await self._create_items(session, run_id, state)
                 await session.flush()
                 state["approval_items_created"] = created
 
         if not existing:
+            # "No items exist" and "no items are possible" are different states, and
+            # conflating them is what made this node loop. The old test was only
+            # "do items exist?" — so a gate that created zero found zero again on every
+            # re-entry, created zero again, and paused again, forever: never progressing,
+            # never failing, and unresolvable from the UI because there was nothing to
+            # click. gate_opened records that creation has already been attempted.
+            already_attempted = bool(state.get("gate_opened"))
+            state["gate_opened"] = True
+
+            if created == 0:
+                # A gate with nothing in it is not a gate. There is nothing for a human
+                # to approve, which means there is nothing to publish — so this is a
+                # failed run, not a paused one. Pausing here presents an empty review
+                # queue as though it were a normal waiting state.
+                raise NodeInputMissing(
+                    "The approval gate has nothing to review: no themes and no draft "
+                    "sections survived the pipeline, so zero approval items could be "
+                    "created. Nothing can be approved and nothing can be published. "
+                    + (
+                        "This gate was already opened once with nothing in it, so "
+                        "re-entering cannot change the outcome. "
+                        if already_attempted
+                        else ""
+                    )
+                    + "Check the earlier stages: this state means an upstream stage "
+                    "produced no output.",
+                    upstream_stage="draft",
+                )
+
             await self.log_decision(
                 run_id,
                 "GATE_OPENED",
-                f"Created {state['approval_items_created']} items for human review. "
+                f"Created {created} items for human review. "
                 f"Run paused until every item has a decision.",
-                {"items": state["approval_items_created"]},
+                {"items": created},
             )
             # Suspend here. Everything completed so far is checkpointed, so resuming
             # re-enters this node rather than replaying the pipeline.

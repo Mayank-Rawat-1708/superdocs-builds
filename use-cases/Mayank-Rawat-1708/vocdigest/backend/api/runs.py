@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from backend.agents.graph import create_run, execute_run, load_state
+from backend.agents.graph import NODE_SEQUENCE, create_run, execute_run, load_state
 from backend.agents.state import STAGES, state_summary
 from backend.config import settings
 from backend.db.database import session_scope
@@ -35,6 +35,19 @@ from backend.models import ApprovalItem, ApprovalStatus, Run, RunStatus, Theme, 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/runs", tags=["runs"])
+
+# Stages an operator may not skip. Derived from the nodes' own declared dependencies
+# rather than listed by hand, so the API and the graph cannot disagree about which
+# stages other stages are built from — plus human_gate, which is protected because
+# skipping it would publish unreviewed content, not because anything reads its output.
+PROTECTED_STAGES: frozenset[str] = frozenset(
+    {"human_gate"}
+    | {
+        required
+        for _name, node_cls in NODE_SEQUENCE
+        for required in getattr(node_cls, "requires", ())
+    }
+)
 
 
 class CreateRunRequest(BaseModel):
@@ -273,18 +286,23 @@ async def skip_stage(
 ) -> dict[str, Any]:
     """Mark a stage SKIPPED so the pipeline moves past it, then resume.
 
-    Deliberately refuses to skip ingest, theme or human_gate: without ingest there is no
-    data, without theme there is nothing to report, and skipping the gate would publish
-    unreviewed content, which defeats the point of the system.
+    Only stages nothing downstream is built from can be skipped. The protected set is
+    every stage that another stage's output is assembled from: skipping one of those does
+    not shorten the pipeline, it feeds the rest of it nothing — which is exactly how a
+    413 in extract ended up as an approval gate holding zero items and reporting itself
+    as a normal waiting state. Skipping the gate is refused for a different reason: it
+    would publish unreviewed content, which is the one thing this system exists to
+    prevent.
     """
     if payload.stage not in STAGES:
         raise HTTPException(400, f"Unknown stage: {payload.stage}")
-    protected = {"ingest", "theme", "human_gate"}
-    if payload.stage in protected:
+    if payload.stage in PROTECTED_STAGES:
         raise HTTPException(
             409,
-            f"Stage '{payload.stage}' cannot be skipped. Skipping it would either leave "
-            f"nothing to report or publish unreviewed content.",
+            f"Stage '{payload.stage}' cannot be skipped. Every later stage is built from "
+            f"its output, so skipping it would leave the rest of the run analysing "
+            f"nothing (or, for the approval gate, publishing unreviewed content). "
+            f"Retry it instead: POST /runs/{run_id}/stages/retry.",
         )
 
     async with session_scope() as session:

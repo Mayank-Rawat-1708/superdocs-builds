@@ -26,11 +26,18 @@ from backend.agents.state import DigestState
 from backend.config import settings
 from backend.db.database import session_scope
 from backend.models import Conversation, RunStatus
+from backend.services.batching import indexed_json_call
 from backend.services.groq_client import GroqClient
 from backend.services.heuristics import heuristic_classify
 from backend.services.llm_gate import run_with_fallback
 
 logger = logging.getLogger(__name__)
+
+# Completion tokens one classification verdict needs. Four short fields plus JSON
+# punctuation; measured rather than guessed, and deliberately rounded up — the cost of
+# over-reserving is one extra call, the cost of under-reserving is a truncated answer
+# that yields nothing at all.
+CLASSIFY_TOKENS_PER_RECORD = 48
 
 _SYSTEM = """\
 You classify customer-support records. For each numbered record decide:
@@ -66,6 +73,7 @@ _INJECTION_HINTS = re.compile(
 class ClassifyNode(BaseNode):
     stage = "classify"
     running_status = RunStatus.CLASSIFYING
+    requires = ("ingest",)
 
     async def run(self, state: DigestState, run_id: uuid.UUID) -> DigestState:
         async with session_scope() as session:
@@ -96,20 +104,28 @@ class ClassifyNode(BaseNode):
 
             for start in range(0, len(rows), batch_size):
                 batch = rows[start : start + batch_size]
-                numbered = "\n\n".join(
-                    f"[{i}] {c.raw_text}" for i, c in enumerate(batch)
-                )
 
-                async def _llm(_numbered=numbered, _n=len(batch)):
+                async def _llm(_batch=batch):
                     groq = GroqClient()
                     try:
-                        payload, usage, _ = await groq.complete_json(
-                            _SYSTEM,
-                            f"Classify these {_n} records.",
-                            untrusted_content=_numbered,
-                            max_tokens=2048,
+                        outcome = await indexed_json_call(
+                            groq,
+                            system=_SYSTEM,
+                            instruction=lambda n: f"Classify these {n} records.",
+                            records=[c.raw_text for c in _batch],
+                            per_record_output_tokens=CLASSIFY_TOKENS_PER_RECORD,
+                            max_output_tokens=2048,
                         )
-                        return payload, usage
+                        if outcome.splits:
+                            logger.info(
+                                "Classify sent %d requests (batch of %d split %d time(s) "
+                                "to stay under the provider's token ceiling)",
+                                outcome.calls, len(_batch), outcome.splits,
+                            )
+                        return (
+                            {"results": list(outcome.results.values())},
+                            outcome.usage,
+                        )
                     finally:
                         await groq.aclose()
 

@@ -77,6 +77,33 @@ class Settings(BaseSettings):
     # temperature=0 everywhere: idempotency requirement. Same input -> same output.
     groq_temperature: float = Field(default=0.0, alias="GROQ_TEMPERATURE")
     groq_timeout_s: float = Field(default=120.0, alias="GROQ_TIMEOUT_S")
+
+    # ---- Groq token ceiling ----------------------------------------------
+    # Groq counts a request's *requested* max_tokens against the per-minute allowance
+    # before generating anything, so prompt + max_tokens must fit under the ceiling or
+    # the call is rejected with a 413 having produced nothing.
+    #
+    # The real ceiling is read from the x-ratelimit-limit-tokens response header and
+    # from the 413 body, both of which state it exactly. This setting is only the
+    # bootstrap for the first request of a process, before any response has been seen;
+    # it is overwritten by the observed value as soon as one arrives. Raise it if your
+    # tier is larger — a too-low bootstrap only costs one extra split on the first call.
+    groq_tpm_limit: int = Field(default=8000, alias="GROQ_TPM_LIMIT")
+    # Held back from the ceiling on every request. Absorbs prompt-estimation error and
+    # the fact that concurrent calls share one allowance.
+    groq_tpm_headroom: int = Field(default=600, alias="GROQ_TPM_HEADROOM")
+    # Smallest completion budget worth sending at all. Below this a reasoning model
+    # spends the whole budget thinking and returns an empty completion, which the API
+    # reports as a JSON validation failure for output that never existed.
+    groq_min_completion_tokens: int = Field(
+        default=384, alias="GROQ_MIN_COMPLETION_TOKENS"
+    )
+    # Extra completion budget added for reasoning models (gpt-oss and friends), which
+    # emit reasoning tokens from the same budget as the answer. reasoning_effort="low"
+    # keeps this small, but it is never zero.
+    groq_reasoning_reserve_tokens: int = Field(
+        default=512, alias="GROQ_REASONING_RESERVE_TOKENS"
+    )
     # Published Groq free-tier pricing for llama-3.3-70b-versatile, USD per 1M tokens.
     # Used only for the cost report; wrong numbers here mis-report cost, nothing else.
     groq_input_cost_per_mtok: float = Field(

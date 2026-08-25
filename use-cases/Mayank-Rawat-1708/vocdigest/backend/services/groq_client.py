@@ -26,6 +26,16 @@ from typing import Any
 import httpx
 
 from backend.config import settings
+from backend.services.token_budget import (
+    budget_for_prompt,
+    calibrate,
+    current_limits,
+    estimate_tokens,
+    note_limit_from_error,
+    observe_headers,
+    token_ceiling,
+    wait_for_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,12 +124,59 @@ class LLMResult:
     content: str
     usage: LLMUsage = field(default_factory=LLMUsage)
     injection_suspected: bool = False
+    #: why the model stopped. "length" means it ran out of completion budget, which is
+    #: the difference between a short answer and a cut-off one.
+    finish_reason: str = ""
 
 
 class GroqError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class GroqBudgetError(GroqError):
+    """The request and the provider's token ceiling cannot both be satisfied.
+
+    Its two subclasses are the two directions that can fail, and the caller's remedy is
+    the same for both: send less at once. Typed rather than left as a bare GroqError so
+    a batching caller can split and retry instead of failing the stage — the provider's
+    own error text ("reduce your message size", "failed to validate JSON") describes a
+    symptom, not the action that fixes it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        plan: Any | None = None,
+        usage: "LLMUsage | None" = None,
+    ) -> None:
+        super().__init__(message, retryable=False)
+        self.plan = plan
+        # Tokens the failed attempt still consumed. A model that spent its whole budget
+        # producing nothing was billed for it, so the cost report has to see it — a
+        # failure that reports zero spend makes the run look cheaper than it was and
+        # lets MAX_TOKENS_PER_RUN be overshot silently.
+        self.usage = usage
+
+
+class GroqRequestTooLarge(GroqBudgetError):
+    """prompt + requested max_tokens exceeds the per-minute ceiling.
+
+    Raised locally before the HTTP call whenever we can see it coming, and on a 413 when
+    the provider sees it first.
+    """
+
+
+class GroqTruncatedOutput(GroqBudgetError):
+    """The model ran out of completion budget mid-answer, so there is no usable output.
+
+    This is the failure that arrives disguised: Groq reports it as
+    400 json_validate_failed with failed_generation: "" — a validation error naming
+    output that was never produced. Treated as a budget problem, because that is what it
+    is, so the caller halves the batch instead of retrying an identical doomed call.
+    """
 
 
 class GroqUnavailable(GroqError):
@@ -187,6 +244,7 @@ class GroqClient:
         *,
         untrusted_content: str | None = None,
         max_tokens: int = 4096,
+        min_completion_tokens: int | None = None,
         response_format_json: bool = False,
     ) -> LLMResult:
         """One chat completion.
@@ -194,6 +252,14 @@ class GroqClient:
         `untrusted_content` is fenced and appended to the user prompt, and its presence
         automatically prepends the injection guard to the system prompt. Callers cannot
         forget the guard — passing untrusted text is what turns it on.
+
+        `min_completion_tokens` is the caller's own floor: the smallest completion budget
+        in which its answer could actually be produced. A caller extracting 20 records
+        needs room for 20 records of JSON, and sending the request with less than that
+        does not produce a short answer — it produces no answer at all. When the floor
+        and the prompt cannot both fit under the provider's ceiling this raises
+        GroqRequestTooLarge *without making the call*, so a batching caller can split at
+        no cost in tokens or wall clock.
         """
         if untrusted_content is not None:
             system_prompt = f"{INJECTION_GUARD}\n\n{system_prompt}"
@@ -214,6 +280,7 @@ class GroqClient:
         }
         if response_format_json:
             body["response_format"] = {"type": "json_object"}
+
             # Groq rejects json_object mode unless the literal word "json" appears
             # somewhere in the messages:
             #   400 "'messages' must contain the word 'json' in some form"
@@ -227,13 +294,47 @@ class GroqClient:
                     "\n\nRespond with a single valid JSON object and nothing else."
                 )
 
-        payload = await self._post_with_retry("/chat/completions", body)
+        # --- size the request against the provider's real ceiling ---
+        prompt_chars = sum(len(str(m.get("content", ""))) for m in body["messages"])
+        prompt_tokens = estimate_tokens(
+            *(str(m.get("content", "")) for m in body["messages"])
+        )
+        floor = int(
+            min_completion_tokens
+            if min_completion_tokens is not None
+            else min(max_tokens, settings.groq_min_completion_tokens)
+        )
+        requested = int(max_tokens)
+
+        if "gpt-oss" in settings.groq_model:
+            # Reasoning models emit their reasoning from the same budget as the answer,
+            # so the answer's own requirement is not the whole requirement. Cap the
+            # reasoning and reserve room for it on top of the caller's floor, rather than
+            # multiplying the caller's number and hoping.
+            body["reasoning_effort"] = "low"
+            reserve = settings.groq_reasoning_reserve_tokens
+            floor += reserve
+            requested += reserve
+
+        plan = budget_for_prompt(prompt_tokens, requested, floor=floor)
+        if not plan.fits:
+            raise GroqRequestTooLarge(
+                f"Request refused before sending: {plan.reason}. Send fewer items per "
+                f"call.",
+                plan=plan,
+            )
+        body["max_tokens"] = plan.max_tokens
+
+        payload = await self._post_with_retry(
+            "/chat/completions", body, planned_tokens=plan.total
+        )
 
         choices = payload.get("choices") or []
         if not choices:
             raise GroqError(f"Groq returned no choices: {payload}")
         content = choices[0].get("message", {}).get("content") or ""
         content = scrub_secrets(content)
+        finish_reason = str(choices[0].get("finish_reason") or "")
 
         raw_usage = payload.get("usage") or {}
         usage = LLMUsage(
@@ -241,6 +342,32 @@ class GroqClient:
             completion_tokens=int(raw_usage.get("completion_tokens", 0)),
             calls=1,
         )
+        # Feed the real prompt size back so the estimator stops guessing.
+        calibrate(prompt_chars, usage.prompt_tokens)
+
+        # An empty answer is not an answer. The model consumed its whole budget without
+        # producing usable output, which is a budget failure however the API labels it —
+        # name it as one here rather than letting "" travel on as a valid completion.
+        if not content.strip():
+            raise GroqTruncatedOutput(
+                f"Model returned an empty completion with finish_reason="
+                f"{finish_reason or 'unknown'!r} after being given "
+                f"{plan.max_tokens} completion tokens "
+                f"({usage.completion_tokens} were consumed, none of them answer). "
+                f"The request was too large to answer in the available budget.",
+                plan=plan,
+                usage=usage,
+            )
+        if finish_reason == "length" and response_format_json:
+            # Truncated prose is degraded but readable; truncated JSON is unparseable.
+            # Only the latter is a failure, and it is the same failure as an empty
+            # completion — the answer did not fit.
+            raise GroqTruncatedOutput(
+                f"Model hit its {plan.max_tokens}-token completion budget mid-answer, "
+                f"so the JSON is incomplete. Send fewer items per call.",
+                plan=plan,
+                usage=usage,
+            )
 
         injection_suspected = bool(
             re.search(
@@ -250,7 +377,10 @@ class GroqClient:
             )
         )
         return LLMResult(
-            content=content, usage=usage, injection_suspected=injection_suspected
+            content=content,
+            usage=usage,
+            injection_suspected=injection_suspected,
+            finish_reason=finish_reason,
         )
 
     async def complete_json(
@@ -260,6 +390,7 @@ class GroqClient:
         *,
         untrusted_content: str | None = None,
         max_tokens: int = 4096,
+        min_completion_tokens: int | None = None,
     ) -> tuple[Any, LLMUsage, bool]:
         """Completion that must return JSON.
 
@@ -272,6 +403,7 @@ class GroqClient:
             user_prompt,
             untrusted_content=untrusted_content,
             max_tokens=max_tokens,
+            min_completion_tokens=min_completion_tokens,
             response_format_json=True,
         )
         parsed = _extract_json(result.content)
@@ -283,7 +415,7 @@ class GroqClient:
         return parsed, result.usage, result.injection_suspected
 
     async def _post_with_retry(
-        self, path: str, body: dict[str, Any]
+        self, path: str, body: dict[str, Any], *, planned_tokens: int = 0
     ) -> dict[str, Any]:
         url = f"{self._base_url}{path}"
         headers = {
@@ -292,6 +424,21 @@ class GroqClient:
         }
         attempts = settings.node_max_retries
         for attempt in range(1, attempts + 1):
+            # Wait out the per-minute window rather than spending it to zero and eating
+            # a 429. The provider tells us what is left and when it refills; ignoring
+            # that and retrying after the rejection costs strictly more wall clock.
+            if planned_tokens:
+                pause = wait_for_tokens(planned_tokens)
+                if 0 < pause <= _MAX_WAIT_S:
+                    limits = current_limits()
+                    logger.info(
+                        "Holding %.1fs for the token window: %s of %s tokens left, this "
+                        "call needs ~%s",
+                        pause, limits.remaining_tokens, limits.limit_tokens,
+                        planned_tokens,
+                    )
+                    await asyncio.sleep(pause)
+
             try:
                 response = await self._client.post(url, headers=headers, json=body)
             except (httpx.ConnectError, httpx.ReadTimeout) as exc:
@@ -303,6 +450,11 @@ class GroqClient:
                 await self._backoff(attempt)
                 continue
 
+            # Every response carries the allowance, rejections included. Recording it
+            # here is what makes the next request's sizing a measurement rather than an
+            # assumption.
+            observe_headers(response.headers)
+
             if response.status_code < 400:
                 return response.json()
 
@@ -310,6 +462,29 @@ class GroqClient:
             if response.status_code in (401, 403):
                 # Not retryable: the key is wrong. Fail immediately with a clear message.
                 raise GroqError(f"Groq rejected credentials: {detail}")
+
+            if response.status_code == 413:
+                # The provider saw the size problem before we did — usually because our
+                # prompt estimate was low. It states the ceiling it enforced, so learn
+                # the real number and let the caller split. Retrying the identical
+                # request cannot succeed.
+                learned = note_limit_from_error(detail)
+                raise GroqRequestTooLarge(
+                    f"Groq rejected the request as too large for its "
+                    f"{learned or token_ceiling()}-token per-minute ceiling. "
+                    f"Send fewer items per call. {detail}"
+                )
+
+            if response.status_code == 400 and _is_empty_generation(detail):
+                # 400 json_validate_failed with failed_generation: "" — Groq's label for
+                # "the model produced nothing". Not a prompt problem and not retryable as
+                # sent: the answer did not fit in the budget.
+                raise GroqTruncatedOutput(
+                    f"Groq reported a JSON validation failure for an empty generation: "
+                    f"the model produced no output at all within its completion budget. "
+                    f"Send fewer items per call. {detail}"
+                )
+
             if response.status_code == 429:
                 header_wait = response.headers.get("Retry-After")
                 wait = (
@@ -380,6 +555,28 @@ def parse_retry_after(message: str) -> float | None:
 def is_daily_quota(message: str) -> bool:
     """Whether a 429 is a per-day allowance rather than a short burst limit."""
     return bool(_DAILY_LIMIT.search(message))
+
+
+# Groq's json_object mode rejects an empty generation as a validation failure:
+#   400 {"error": {"code": "json_validate_failed", "failed_generation": ""}}
+# The empty failed_generation is the tell — a malformed-but-present answer is a real
+# formatting problem, an absent one is a budget problem.
+_EMPTY_GENERATION = re.compile(
+    r'"failed_generation"\s*:\s*""|json_validate_failed', re.IGNORECASE
+)
+
+
+def _is_empty_generation(detail: str) -> bool:
+    """Whether a 400 is Groq reporting output that was never produced."""
+    if not _EMPTY_GENERATION.search(detail or ""):
+        return False
+    match = re.search(r'"failed_generation"\s*:\s*"((?:[^"\\]|\\.)*)"', detail or "")
+    if match is None:
+        # json_validate_failed with the generation not shown (truncated body). Treat it
+        # as a budget failure: that is the cause in every observed case, and the remedy
+        # (send less) is harmless if it is not.
+        return True
+    return not match.group(1).strip()
 
 
 def _extract_json(text: str) -> Any | None:

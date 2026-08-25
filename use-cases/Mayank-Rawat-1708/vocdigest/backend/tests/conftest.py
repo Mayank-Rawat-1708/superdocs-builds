@@ -186,6 +186,7 @@ class FakeGroqClient:
         *,
         untrusted_content: str | None = None,
         max_tokens: int = 4096,
+        min_completion_tokens: int | None = None,
         response_format_json: bool = False,
     ) -> LLMResult:
         if type(self).fail_with:
@@ -203,6 +204,7 @@ class FakeGroqClient:
         *,
         untrusted_content: str | None = None,
         max_tokens: int = 4096,
+        min_completion_tokens: int | None = None,
     ) -> tuple[Any, LLMUsage, bool]:
         if type(self).fail_with:
             raise type(self).fail_with

@@ -19,9 +19,9 @@ import logging
 import uuid
 from collections import defaultdict
 
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 
-from backend.agents.nodes.base import BaseNode, NodeSkip
+from backend.agents.nodes.base import BaseNode, NodeInputMissing
 from backend.agents.state import DigestState
 from backend.config import settings
 from backend.db.database import session_scope
@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 # Themes below this many conversations get a confidence note rather than being asserted
 # as a trend. Three is the smallest number where "pattern" is arguably honest.
 MIN_CONFIDENT_VOLUME = 3
+
+# Completion tokens one cluster's name and description need. The naming answer grows with
+# the cluster count, so the budget has to as well.
+TOKENS_PER_CLUSTER_NAME = 64
 
 _SYSTEM = """\
 You name clusters of customer-support conversations.
@@ -93,6 +97,9 @@ def _greedy_cluster(
 class ThemeNode(BaseNode):
     stage = "theme"
     running_status = RunStatus.THEMING
+    # Clustering is done on the embeddings extract produced. Without them there is
+    # nothing to cluster, and 0 themes is not a small digest — it is no digest.
+    requires = ("extract",)
 
     def __init__(self, cluster_threshold: float | None = None) -> None:
         super().__init__()
@@ -117,10 +124,40 @@ class ThemeNode(BaseNode):
             )
 
             if not rows:
-                raise NodeSkip(
-                    "No embedded conversations available to cluster",
-                    {"theme_count": 0, "theme_ids": []},
+                raise NodeInputMissing(
+                    "No embedded conversations available to cluster. The extract stage "
+                    "produced no usable output, so there is nothing to group into "
+                    "themes and nothing to report.",
+                    upstream_stage="extract",
                 )
+
+            # Clear any themes a previous attempt at this stage left behind. Theme rows
+            # are created, not upserted, so a re-run appended a second full set instead
+            # of replacing the first: a retried stage turned 16 themes into 32, then 48,
+            # then 80, each round reported as a normal result. Deleting first makes the
+            # stage idempotent, which is what the rest of the pipeline already assumes.
+            stale = list(
+                (
+                    await session.execute(select(Theme).where(Theme.run_id == run_id))
+                ).scalars()
+            )
+            if stale:
+                logger.info(
+                    "Removing %d theme(s) from a previous attempt at this stage",
+                    len(stale),
+                )
+                # Detach every conversation in the run, not only the ones being
+                # re-clustered: an irrelevant or unembedded row could still be pointing
+                # at a theme from the earlier attempt.
+                await session.execute(
+                    sa_update(Conversation)
+                    .where(Conversation.run_id == run_id)
+                    .values(theme_id=None)
+                )
+                await session.flush()
+                for theme in stale:
+                    await session.delete(theme)
+                await session.flush()
 
             by_id = {c.id: c for c in rows}
             # Order by the input's natural key (file, line), NOT by row id. Row ids are
@@ -152,6 +189,14 @@ class ThemeNode(BaseNode):
                 for i, phrases in enumerate(cluster_phrases)
             )
 
+            # Budget the naming answer against how many clusters it must name, rather
+            # than a fixed number that is generous for 5 clusters and short for 50.
+            # Running short truncates the JSON, which yields no names at all instead of
+            # short ones.
+            naming_budget = min(
+                TOKENS_PER_CLUSTER_NAME * max(len(clusters), 1) + 128, 4096
+            )
+
             async def _llm():
                 groq = GroqClient()
                 try:
@@ -159,16 +204,21 @@ class ThemeNode(BaseNode):
                         _SYSTEM,
                         f"Name these {len(clusters)} clusters.",
                         untrusted_content=payload_in,
-                        max_tokens=2048,
+                        max_tokens=naming_budget,
+                        min_completion_tokens=naming_budget,
                     )
                     return payload, usage
                 finally:
                     await groq.aclose()
 
             # Clustering itself is embedding-based and needs no model — only the naming
-            # does. A Groq outage therefore costs label quality, not the analysis.
+            # does. A Groq outage therefore costs label quality, not the analysis, and
+            # the same is true of a request too large to fit: fall back to frequency-
+            # based names and disclose it, rather than failing a run whose findings are
+            # already complete.
             gated = await run_with_fallback(
-                "theme", _llm, lambda: heuristic_name_clusters(cluster_phrases)
+                "theme", _llm, lambda: heuristic_name_clusters(cluster_phrases),
+                degrade_on_budget_error=True,
             )
             payload = gated.data
             self.usage.merge(gated.usage)

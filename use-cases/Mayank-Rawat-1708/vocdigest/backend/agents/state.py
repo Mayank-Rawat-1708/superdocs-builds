@@ -92,6 +92,11 @@ class DigestState(TypedDict, total=False):
     draft_warnings: list[str]
 
     # human_gate
+    # Whether item creation has been attempted. Distinguishes "the gate has not been
+    # opened yet" from "the gate was opened and there was nothing to put in it" — two
+    # states that both show zero items and must not be treated the same, or re-entry
+    # loops forever creating nothing.
+    gate_opened: bool
     approval_items_created: int
     approval_items_approved: int
     approval_items_rejected: int
@@ -148,6 +153,7 @@ def build_initial_state(
         disappeared_themes=[],
         draft_sections={},
         draft_warnings=[],
+        gate_opened=False,
         approval_items_created=0,
         approval_items_approved=0,
         approval_items_rejected=0,

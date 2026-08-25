@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable
 
 from backend.config import MissingCredentialError, settings
 from backend.services.groq_client import (
+    GroqBudgetError,
     GroqError,
     GroqQuotaExhausted,
     GroqUnavailable,
@@ -78,6 +79,8 @@ async def run_with_fallback(
     stage: str,
     llm_call: Callable[[], Awaitable[tuple[Any, LLMUsage]]],
     heuristic_call: Callable[[], Any],
+    *,
+    degrade_on_budget_error: bool = False,
 ) -> GatedResult:
     """Run the LLM path, falling back to heuristics on unavailability.
 
@@ -85,6 +88,13 @@ async def run_with_fallback(
     credits. A GroqError caused by malformed output is re-raised so the node's normal
     retry can handle it, because silently degrading on a transient parse failure would
     quietly lower quality for a problem that would have fixed itself.
+
+    `degrade_on_budget_error` is opt-in for the callers whose LLM contribution is a label
+    or a parse rather than the analysis itself — theme naming, reading a prior digest.
+    Those have a real heuristic equivalent and losing them costs presentation, not
+    findings. It is deliberately off by default: for classify and extract the right
+    answer to a request that will not fit is to split it, and degrading instead would
+    trade the model's output for keyword output over a problem that has a proper fix.
     """
     if not groq_available():
         if not settings.allow_degraded_analysis:
@@ -121,6 +131,17 @@ async def run_with_fallback(
             raise
         # Transient: an outage or a short burst limit already retried by the client.
         return _degrade(stage, heuristic_call, f"Groq unavailable: {exc}")
+
+    except GroqBudgetError as exc:
+        # The request and the provider's ceiling cannot both be satisfied. Retrying it
+        # unchanged is guaranteed to fail the same way, so either the caller splits (the
+        # default, for the stages that can) or it degrades here, with disclosure.
+        if not degrade_on_budget_error:
+            raise
+        if not settings.allow_degraded_analysis:
+            raise
+        return _degrade(stage, heuristic_call, f"the request exceeded Groq's token "
+                                               f"ceiling and could not be split: {exc}")
 
     except GroqError:
         # Malformed output, not unavailability. Let the node retry.
